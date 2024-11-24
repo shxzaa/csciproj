@@ -1,0 +1,162 @@
+#include <webots/robot.h>
+#include <webots/light_sensor.h>
+#include <webots/distance_sensor.h>
+#include <webots/motor.h>
+#include <webots/led.h>
+#include <stdio.h>
+
+#define CYCLE_INTERVAL 32
+#define MOTOR_SPEED_MAX 6.28
+#define CYCLE_TWO_START_TIME 270.0   // Time to start the second cycle in seconds
+#define PAUSE_LENGTH 100.0           // Time for pause in seconds
+#define LIGHT_THRESHOLD 4211.852150  // Light intensity threshold for stopping
+
+// Device tags
+WbDeviceTag left_wheel, right_wheel;
+WbDeviceTag sensors_proximity[8];
+WbDeviceTag sensor_light;
+WbDeviceTag led_indicator;
+
+// Flags for cycle management
+bool is_robot_paused = false;
+bool is_exploration_done = false;
+bool is_second_cycle_active = false;
+double pause_time_marker = 0.0;
+double highest_light_intensity = 0.0;
+
+// Initialize all robot components
+void initialize_robot() {
+  left_wheel = wb_robot_get_device("left wheel motor");
+  right_wheel = wb_robot_get_device("right wheel motor");
+  wb_motor_set_position(left_wheel, INFINITY);
+  wb_motor_set_position(right_wheel, INFINITY);
+
+  // Initialize proximity sensors
+  for (int i = 0; i < 8; i++) {
+    char sensor_name[4];
+    sprintf(sensor_name, "ps%d", i);
+    sensors_proximity[i] = wb_robot_get_device(sensor_name);
+    wb_distance_sensor_enable(sensors_proximity[i], CYCLE_INTERVAL);
+  }
+
+  // Initialize light sensor
+  sensor_light = wb_robot_get_device("ls0");
+  wb_light_sensor_enable(sensor_light, CYCLE_INTERVAL);
+
+  // Initialize LED
+  led_indicator = wb_robot_get_device("led0");
+  wb_led_set(led_indicator, 0);  // Ensure LED is off
+}
+
+// Function to blink the LED a specified number of times
+void blink_led_indicator(int num_blinks) {
+  for (int i = 0; i < num_blinks; i++) {
+    wb_led_set(led_indicator, 1);  // LED ON
+    wb_robot_step(1000);           // Wait for 1 second
+    wb_led_set(led_indicator, 0);  // LED OFF
+    wb_robot_step(1000);           // Wait for 1 second
+  }
+}
+
+// Function to handle robot's sensors and motor actions
+void process_robot_movements() {
+  double current_time = wb_robot_get_time();
+
+  // Check if the robot is in pause mode
+  if (is_robot_paused) {
+    if (current_time - pause_time_marker >= PAUSE_LENGTH) {
+      printf("Robot resumes at time: %.2f\n", current_time);
+      is_robot_paused = false;
+    } else {
+      return;  // Stay paused until time is up
+    }
+  }
+
+  // Trigger second cycle after the specified time
+  if (current_time >= CYCLE_TWO_START_TIME && !is_second_cycle_active) {
+    is_second_cycle_active = true;
+    is_exploration_done = true;  // Switch to second phase
+    printf("Started second cycle at time: %.2f\n", current_time);
+  }
+
+  // Get proximity sensor values
+  double proximity_values[8];
+  for (int i = 0; i < 8; i++) {
+    proximity_values[i] = wb_distance_sensor_get_value(sensors_proximity[i]);
+  }
+
+  // Get current light intensity reading
+  double current_light_value = wb_light_sensor_get_value(sensor_light);
+
+  // Track brightest light intensity during first phase
+  if (!is_exploration_done) {
+    if (current_light_value > highest_light_intensity) {
+      highest_light_intensity = current_light_value;
+      printf("New maximum light intensity detected: %.2f\n", highest_light_intensity);
+    }
+  } else {
+    // In second cycle, stop if the light intensity exceeds threshold
+    if (current_light_value >= LIGHT_THRESHOLD) {
+      printf("Light intensity threshold reached: %.2f\n", current_light_value);
+      wb_motor_set_velocity(left_wheel, 0.0);  // Stop the left motor
+      wb_motor_set_velocity(right_wheel, 0.0); // Stop the right motor
+      blink_led_indicator(3);  // Blink the LED 3 times to signal stop
+      return;  // Stop any further movement
+    }
+  }
+
+  // Define default motor speeds
+  double left_motor_speed = MOTOR_SPEED_MAX;
+  double right_motor_speed = MOTOR_SPEED_MAX;
+
+  bool obstacle_ahead = proximity_values[0] > 80 || proximity_values[7] > 80;
+  bool left_blocked = proximity_values[5] > 80;
+  bool right_blocked = proximity_values[2] > 80;
+
+  // Logic to handle obstacle avoidance
+  if (obstacle_ahead) {
+    if (left_blocked && right_blocked) {
+      left_motor_speed = -0.5 * MOTOR_SPEED_MAX;
+      right_motor_speed = -0.5 * MOTOR_SPEED_MAX;  // Move backwards
+    } else if (left_blocked) {
+      left_motor_speed = MOTOR_SPEED_MAX;
+      right_motor_speed = 0.1 * MOTOR_SPEED_MAX;  // Turn right
+    } else if (right_blocked) {
+      left_motor_speed = 0.1 * MOTOR_SPEED_MAX;
+      right_motor_speed = MOTOR_SPEED_MAX;  // Turn left
+    } else {
+      left_motor_speed = MOTOR_SPEED_MAX;
+      right_motor_speed = -0.1 * MOTOR_SPEED_MAX;  // Reverse slightly
+    }
+  } else {
+    // No obstacles ahead, proceed forward
+    if (left_blocked && !right_blocked) {
+      left_motor_speed = 0.1 * MOTOR_SPEED_MAX;
+      right_motor_speed = MOTOR_SPEED_MAX;  // Turn slightly left
+    } else if (!left_blocked && !right_blocked) {
+      left_motor_speed = 0.5 * MOTOR_SPEED_MAX;
+      right_motor_speed = 0.5 * MOTOR_SPEED_MAX;  // Move straight
+    } else if (!left_blocked && right_blocked) {
+      left_motor_speed = MOTOR_SPEED_MAX;
+      right_motor_speed = 0.1 * MOTOR_SPEED_MAX;  // Turn slightly right
+    }
+  }
+
+  // Apply calculated motor speeds
+  wb_motor_set_velocity(left_wheel, left_motor_speed);
+  wb_motor_set_velocity(right_wheel, right_motor_speed);
+}
+
+int main() {
+  wb_robot_init();  // Initialize the robot
+
+  initialize_robot();  // Set up the robot devices
+
+  // Main control loop
+  while (wb_robot_step(CYCLE_INTERVAL) != -1) {
+    process_robot_movements();  // Manage robot movement and logic
+  }
+
+  wb_robot_cleanup();  // Cleanup after the simulation ends
+  return 0;
+}
